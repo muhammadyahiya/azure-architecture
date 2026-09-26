@@ -1,0 +1,63 @@
+# Rolls the images app-ci.yml just built out to both Container Apps.
+# rag-api gets a traffic-split revision (canary) since it's user-facing;
+# processing-worker just takes the new image outright since nothing is
+# "live" waiting on a specific revision of a queue consumer.
+name: app-cd
+
+on:
+  workflow_run:
+    workflows: ["app-ci"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  CANARY_TRAFFIC_PERCENT: 20
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy processing-worker (straight update, no live traffic to split)
+        run: |
+          az containerapp update \
+            --name ca-processing-worker-${{ vars.PROJECT_SUFFIX }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.ACR_NAME }}.azurecr.io/processing-worker:${{ github.event.workflow_run.head_sha }}
+
+      - name: Deploy rag-api as a new revision at canary traffic
+        run: |
+          az containerapp update \
+            --name ca-rag-api-${{ vars.PROJECT_SUFFIX }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.ACR_NAME }}.azurecr.io/rag-api:${{ github.event.workflow_run.head_sha }} \
+            --revision-suffix ${{ github.event.workflow_run.head_sha }}
+
+          LATEST_REVISION=$(az containerapp revision list \
+            --name ca-rag-api-${{ vars.PROJECT_SUFFIX }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "[?properties.active].name | [0]" -o tsv)
+
+          az containerapp ingress traffic set \
+            --name ca-rag-api-${{ vars.PROJECT_SUFFIX }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --revision-weight "${LATEST_REVISION}=${{ env.CANARY_TRAFFIC_PERCENT }}" latest=$((100 - ${{ env.CANARY_TRAFFIC_PERCENT }}))
+
+      # Promote to 100% manually once you've watched error rate / groundedness
+      # eval scores on the canary slice — this template deliberately does not
+      # auto-promote (see docs/decision-log.md on why LLM behavior needs a
+      # human checkpoint that model accuracy metrics alone don't cover).

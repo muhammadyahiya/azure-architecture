@@ -1,0 +1,67 @@
+# Deploys infra/*.bicep. PRs get a `what-if` comment; merges to main deploy.
+# Auth is OIDC workload identity federation — AZURE_CLIENT_ID/TENANT_ID/
+# SUBSCRIPTION_ID are identifiers, not passwords, but still stored as repo
+# secrets by convention. There is no client secret anywhere in this pipeline.
+name: infra-cd
+
+on:
+  pull_request:
+    paths: ["infra/**"]
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+
+permissions:
+  id-token: write   # required for OIDC federation
+  contents: read
+  pull-requests: write  # to post the what-if comment on PRs
+
+env:
+  AZURE_LOCATION: eastus2
+
+jobs:
+  what-if:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Bicep what-if
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          region: ${{ env.AZURE_LOCATION }}
+          template: infra/main.bicep
+          parameters: infra/main.parameters.json cicdPrincipalId=${{ secrets.AZURE_CLIENT_OBJECT_ID }}
+          deploymentMode: Incremental
+          additionalArguments: "--what-if"
+
+  deploy:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Bicep
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          region: ${{ env.AZURE_LOCATION }}
+          template: infra/main.bicep
+          parameters: infra/main.parameters.json cicdPrincipalId=${{ secrets.AZURE_CLIENT_OBJECT_ID }}
+          deploymentMode: Incremental

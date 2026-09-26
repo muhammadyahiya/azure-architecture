@@ -1,0 +1,92 @@
+# Azure DevOps equivalent of .github/workflows/{infra-cd,app-ci,app-cd}.yml.
+# Uses an Azure Resource Manager service connection configured for Workload
+# Identity Federation (Project Settings -> Service connections -> new ARM
+# connection -> "Workload identity federation") — same zero-secrets posture
+# as the GitHub OIDC login, just ADO's flavor of it.
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/*, src/*, mlops/*]
+
+variables:
+  azureServiceConnection: "azure-genai-platform-wif"   # name of the ARM service connection
+  acrName: "$(ACR_NAME)"                                 # pipeline variable group
+  resourceGroup: "$(RESOURCE_GROUP)"
+  projectSuffix: "$(PROJECT_SUFFIX)"
+
+stages:
+  - stage: InfraCD
+    condition: contains(variables['Build.SourceVersionMessage'], 'infra')
+    jobs:
+      - job: DeployInfra
+        pool: { vmImage: "ubuntu-latest" }
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment sub create \
+                  --location eastus2 \
+                  --template-file infra/main.bicep \
+                  --parameters infra/main.parameters.json \
+                  --parameters cicdPrincipalId=$(AZURE_CLIENT_OBJECT_ID)
+
+  - stage: AppCI
+    jobs:
+      - job: LintTestBuild
+        pool: { vmImage: "ubuntu-latest" }
+        strategy:
+          matrix:
+            processing_worker: { serviceName: "processing_worker" }
+            rag_api: { serviceName: "rag_api" }
+        steps:
+          - task: UsePythonVersion@0
+            inputs: { versionSpec: "3.12" }
+          - script: |
+              pip install ruff pytest -r src/$(serviceName)/requirements.txt
+              ruff check src/$(serviceName)
+              pytest src/$(serviceName) -q
+            displayName: "Lint + test $(serviceName)"
+          - task: AzureCLI@2
+            displayName: "Build + push $(serviceName) via ACR Tasks"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                IMAGE_NAME=$(echo $(serviceName) | tr '_' '-')
+                az acr build \
+                  --registry $(acrName) \
+                  --image ${IMAGE_NAME}:$(Build.SourceVersion) \
+                  --image ${IMAGE_NAME}:latest \
+                  --file src/$(serviceName)/Dockerfile \
+                  src/
+
+  - stage: AppCD
+    dependsOn: AppCI
+    condition: succeeded()
+    jobs:
+      - job: DeployContainerApps
+        pool: { vmImage: "ubuntu-latest" }
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az containerapp update \
+                  --name ca-processing-worker-$(projectSuffix) \
+                  --resource-group $(resourceGroup) \
+                  --image $(acrName).azurecr.io/processing-worker:$(Build.SourceVersion)
+
+                az containerapp update \
+                  --name ca-rag-api-$(projectSuffix) \
+                  --resource-group $(resourceGroup) \
+                  --image $(acrName).azurecr.io/rag-api:$(Build.SourceVersion) \
+                  --revision-suffix $(Build.SourceVersion)
+                # Add the traffic-split canary logic from .github/workflows/app-cd.yml
+                # here too if you're standardizing on ADO instead of running both.

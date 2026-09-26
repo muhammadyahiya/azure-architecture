@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "projectName": { "value": "myragapp" },
+    "environmentName": { "value": "dev" },
+    "location": { "value": "eastus2" },
+    "vnetSubnetId": { "value": "" },
+    "cicdPrincipalId": { "value": "<object-id-of-the-github-actions-federated-app-registration>" }
+  }
+}

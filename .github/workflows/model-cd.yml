@@ -1,0 +1,120 @@
+# The MLOps track for a model you actually train/fine-tune yourself — separate
+# from app-ci/app-cd, which ship the RAG/orchestration app around a hosted
+# foundation model. Don't run this pipeline if you have nothing to retrain;
+# see docs/decision-log.md ("MLOps vs. LLMOps").
+name: model-cd
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_path:
+        description: "Path/URI to the training data snapshot"
+        required: true
+  push:
+    branches: [main]
+    paths: ["mlops/**"]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AML_WORKSPACE_NAME: ${{ vars.AML_WORKSPACE_NAME }}   # same resource as your Foundry hub/project
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  MODEL_NAME: ${{ vars.MODEL_NAME }}
+  ENDPOINT_NAME: ${{ vars.ENDPOINT_NAME }}
+  EVAL_METRIC_NAME: accuracy
+  EVAL_THRESHOLD: "0.85"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    outputs:
+      job_name: ${{ steps.submit.outputs.job_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r mlops/environment.yml || pip install azure-ai-ml azure-identity
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - id: submit
+        working-directory: mlops
+        run: |
+          python train.py \
+            --experiment-name genai-platform-template \
+            --data-path "${{ inputs.data_path || vars.DEFAULT_DATA_PATH }}"
+
+      # NOTE: for a real pipeline, poll `az ml job show` (or ml_client.jobs.stream)
+      # here until the job reaches a terminal state before moving to evaluate —
+      # omitted for brevity in this template.
+
+  evaluate:
+    needs: train
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install azure-ai-ml azure-identity
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Evaluation gate
+        working-directory: mlops
+        run: |
+          python evaluate.py \
+            --job-name ${{ needs.train.outputs.job_name }} \
+            --metric-name ${{ env.EVAL_METRIC_NAME }} \
+            --threshold ${{ env.EVAL_THRESHOLD }} \
+            --subscription-id ${{ secrets.AZURE_SUBSCRIPTION_ID }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --workspace-name ${{ env.AML_WORKSPACE_NAME }}
+        # Non-zero exit here stops the pipeline — register/deploy never run on a failing model.
+
+  register-and-deploy:
+    needs: [train, evaluate]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install azure-ai-ml azure-identity
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Register model
+        id: register
+        working-directory: mlops
+        run: |
+          python register_model.py \
+            --job-name ${{ needs.train.outputs.job_name }} \
+            --model-name ${{ env.MODEL_NAME }} \
+            --subscription-id ${{ secrets.AZURE_SUBSCRIPTION_ID }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --workspace-name ${{ env.AML_WORKSPACE_NAME }}
+
+      - name: Deploy canary
+        working-directory: mlops
+        run: |
+          python deploy_endpoint.py \
+            --endpoint-name ${{ env.ENDPOINT_NAME }} \
+            --model-name ${{ env.MODEL_NAME }} \
+            --model-version latest \
+            --deployment-name deploy-${{ github.sha }} \
+            --canary-traffic-percent 10 \
+            --subscription-id ${{ secrets.AZURE_SUBSCRIPTION_ID }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --workspace-name ${{ env.AML_WORKSPACE_NAME }}
